@@ -4,6 +4,13 @@ import re
 import math
 import zipfile
 import io
+import docker
+import tempfile
+import os
+
+import os
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
 app = Flask(__name__)
 
@@ -16,19 +23,9 @@ SCAN_EXTENSIONS = [
     ".vbs", ".php", ".rb", ".java", ".c", ".cpp", ".go",
     ".rs", ".pl", ".lua", ".ino"
 ]
-
-FLAG_ONLY_EXTENSIONS = [
-    ".exe", ".jar", ".msi", ".scr", ".dll", ".com", ".apk"
-]
-
-MACRO_RISK_EXTENSIONS = [
-    ".docm", ".xlsm", ".pptm"
-]
-
-ARCHIVE_EXTENSIONS = [
-    ".zip", ".rar", ".7z", ".tar", ".gz"
-]
-
+FLAG_ONLY_EXTENSIONS = [".exe", ".jar", ".msi", ".scr", ".dll", ".com", ".apk"]
+MACRO_RISK_EXTENSIONS = [".docm", ".xlsm", ".pptm"]
+ARCHIVE_EXTENSIONS = [".zip", ".rar", ".7z", ".tar", ".gz"]
 SKIP_EXTENSIONS = [
     ".json", ".yaml", ".yml", ".txt", ".md", ".png", ".jpg",
     ".jpeg", ".gif", ".svg", ".ico", ".lock", ".gitignore"
@@ -64,14 +61,12 @@ def parse_github_url(url):
 # ─────────────────────────────────────
 def get_files_from_github(owner, repo, path=""):
     api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    response = requests.get(api_url)
+    response = requests.get(api_url, headers=GITHUB_HEADERS)
     if response.status_code != 200:
         return []
     items = response.json()
-
     if isinstance(items, dict):
         items = [items]
-
     files = []
     for item in items:
         if item["type"] == "file":
@@ -80,10 +75,17 @@ def get_files_from_github(owner, repo, path=""):
             files.extend(get_files_from_github(owner, repo, item["path"]))
     return files
 
+def get_file_content(download_url):
+    try:
+        response = requests.get(download_url, headers=GITHUB_HEADERS)
+        return response.text
+    except:
+        return ""
+
 
 def get_file_content(download_url):
     try:
-        response = requests.get(download_url)
+        response = requests.get(download_url, headers=GITHUB_HEADERS)
         return response.text
     except:
         return ""
@@ -164,18 +166,67 @@ def entropy_scan(content, filename):
             })
     return findings
 
+def sandbox_scan(content, filename):
+    findings = []
+    try:
+        client = docker.from_env()
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(content)
+            temp_path = f.name
+        try:
+            result = client.containers.run(
+                "python:3.11-slim",
+                command=f"timeout 10 python /code/{filename}",
+                volumes={temp_path: {'bind': f'/code/{filename}', 'mode': 'ro'}},
+                network_disabled=True,
+                read_only=True,
+                mem_limit='64m',
+                cpu_period=100000,
+                cpu_quota=50000,
+                remove=True,
+                timeout=15,
+                stderr=True
+            )
+            output = result.decode('utf-8', errors='ignore')
+            suspicious_outputs = [
+                "connection refused", "permission denied", "socket",
+                "wget", "curl", "subprocess", "os.system",
+            ]
+            for pattern in suspicious_outputs:
+                if pattern.lower() in output.lower():
+                    findings.append({
+                        "file": filename,
+                        "type": "SANDBOX",
+                        "severity": "HIGH",
+                        "description": f"Suspicious behavior in sandbox: '{pattern}' found in output",
+                    })
+        except docker.errors.ContainerError as e:
+            error_output = str(e)
+            if any(p in error_output.lower() for p in ["network", "socket", "connection", "permission"]):
+                findings.append({
+                    "file": filename,
+                    "type": "SANDBOX",
+                    "severity": "HIGH",
+                    "description": f"Suspicious behavior detected: {error_output[:200]}",
+                })
+        finally:
+            os.unlink(temp_path)
+    except Exception as e:
+        findings.append({
+            "file": filename,
+            "type": "SANDBOX",
+            "severity": "INFO",
+            "description": f"Sandbox scan skipped: {str(e)[:100]}",
+        })
+    return findings
 
-# ─────────────────────────────────────
-# ZIP ARCHIVE — IN-MEMORY INSPECTION
-# ─────────────────────────────────────
 def scan_zip_in_memory(download_url, zip_filename):
     findings = []
     scanned = []
 
     try:
         response = requests.get(download_url)
-        zip_bytes = io.BytesIO(response.content)  # RAM only, never saved to disk
-
+        zip_bytes = io.BytesIO(response.content)
         with zipfile.ZipFile(zip_bytes) as archive:
             for inner_name in archive.namelist():
                 inner_ext = "." + inner_name.split(".")[-1].lower() if "." in inner_name else ""
@@ -188,7 +239,7 @@ def scan_zip_in_memory(download_url, zip_filename):
                         "file": f"{zip_filename} → {inner_name}",
                         "type": "BINARY",
                         "severity": "MEDIUM",
-                        "description": "Executable found inside archive — cannot text-scan. Manual review recommended.",
+                        "description": "Executable found inside archive — manual review recommended.",
                     })
                     continue
 
@@ -262,7 +313,7 @@ def scan():
                 "file": filename,
                 "type": "BINARY",
                 "severity": "MEDIUM",
-                "description": "Executable/compiled file detected — cannot perform static text analysis. Manual review strongly recommended before running.",
+                "description": "Executable/compiled file detected — manual review strongly recommended.",
             })
             continue
 
@@ -271,7 +322,7 @@ def scan():
                 "file": filename,
                 "type": "MACRO_RISK",
                 "severity": "MEDIUM",
-                "description": "Macro-enabled document detected — may contain auto-executing embedded code. Open with macros disabled.",
+                "description": "Macro-enabled document detected — open with macros disabled.",
             })
             continue
 
@@ -280,6 +331,8 @@ def scan():
             scanned_files.append(filename)
             all_findings.extend(regex_scan(content, filename))
             all_findings.extend(entropy_scan(content, filename))
+            if filename.endswith('.py'):
+                all_findings.extend(sandbox_scan(content, filename))
         else:
             skipped_files.append(filename)
 
@@ -293,7 +346,7 @@ def scan():
     else:
         status = "CLEAN"
 
-    result = {
+    return jsonify({
         "owner": owner,
         "repo": repo,
         "path": path,
@@ -305,10 +358,7 @@ def scan():
         "total_findings": len(all_findings),
         "status": status,
         "findings": all_findings,
-    }
-
-    return jsonify(result)
-
+    })
 
 @app.route("/", methods=["GET"])
 def health():
