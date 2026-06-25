@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+﻿from flask import Flask, jsonify, request
 import requests
 import re
 import math
@@ -7,13 +7,14 @@ import io
 import docker
 import tempfile
 import os
+from dotenv import load_dotenv
 
-import os
+load_dotenv()
+
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
 app = Flask(__name__)
-
 # ─────────────────────────────────────
 # FILE TIER CLASSIFICATION
 # ─────────────────────────────────────
