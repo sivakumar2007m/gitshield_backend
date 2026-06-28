@@ -19,6 +19,18 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 app = Flask(__name__)
 
+# Near the top of app.py, after imports
+def docker_is_available():
+    try:
+        client = docker.from_env(timeout=2)
+        client.ping()
+        return True
+    except Exception:
+        return False
+
+DOCKER_AVAILABLE = docker_is_available()
+print(f"DOCKER AVAILABLE: {DOCKER_AVAILABLE}")
+
 # ─────────────────────────────────────
 # FILE TIER CLASSIFICATION
 # ─────────────────────────────────────
@@ -254,9 +266,26 @@ def execute_in_sandbox(file_bytes, filename, rel_label):
     if not interpreter:
         return []
 
+    if not DOCKER_AVAILABLE:
+        return [{
+            "file": rel_label, "type": "SANDBOX", "severity": "INFO",
+            "description": "Sandbox execution unavailable in this environment (no Docker access). Static analysis (Regex, Entropy, AI) still applied.",
+            "engine": "Engine 3 — Behavioral Sandbox"
+        }]
+
+    # Fast-fail if Docker isn't available at all (e.g. on Render)
+    try:
+        client = docker.from_env(timeout=2)  # 2 second connection timeout
+        client.ping()
+    except Exception:
+        return [{
+            "file": rel_label, "type": "SANDBOX", "severity": "INFO",
+            "description": "Sandbox execution unavailable in this environment (no Docker access). Static analysis (Regex, Entropy, AI) still applied.",
+            "engine": "Engine 3 — Behavioral Sandbox"
+        }]
+
     container = None
     try:
-        client = docker.from_env()
         container = client.containers.create(
             DOCKER_IMAGE,
             command=["sleep", "60"],
@@ -281,7 +310,7 @@ def execute_in_sandbox(file_bytes, filename, rel_label):
     except docker.errors.ImageNotFound:
         return [{
             "file": rel_label, "type": "SANDBOX", "severity": "INFO",
-            "description": "Sandbox image not found — build it first: docker build -f Dockerfile.sandbox -t gitshield-sandbox:latest .",
+            "description": "Sandbox image not found — build it first.",
             "engine": "Engine 3 — Behavioral Sandbox"
         }]
     except Exception as e:
@@ -296,7 +325,6 @@ def execute_in_sandbox(file_bytes, filename, rel_label):
                 container.remove(force=True)
             except Exception:
                 pass
-
 # ─────────────────────────────────────
 # ENGINE 4 — AI ANALYSIS
 # ─────────────────────────────────────
