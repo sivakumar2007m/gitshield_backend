@@ -54,6 +54,10 @@ SKIP_EXTENSIONS = [
     ".jpeg", ".gif", ".svg", ".ico", ".lock", ".gitignore"
 ]
 
+# Files that need AI string analysis specifically because they CANNOT
+# be run through the sandbox (compiled binaries, unopenable archives)
+AI_ANALYSIS_EXTENSIONS = FLAG_ONLY_EXTENSIONS + ARCHIVE_EXTENSIONS + MACRO_RISK_EXTENSIONS
+
 # ─────────────────────────────────────
 # URL PARSER
 # ─────────────────────────────────────
@@ -264,12 +268,6 @@ def parse_behavior(trace_output, rel_label):
     return findings
 
 def execute_in_sandbox(file_bytes, filename, rel_label):
-    """
-    Returns:
-      - [] if file type isn't executable (no interpreter match)
-      - [unavailable finding] if Docker isn't reachable in this environment
-      - [behavioral findings] if sandbox ran successfully
-    """
     ext = "." + filename.split(".")[-1].lower() if "." in filename else ""
     interpreter = INTERPRETER_MAP.get(ext)
     if not interpreter:
@@ -280,7 +278,7 @@ def execute_in_sandbox(file_bytes, filename, rel_label):
             "file": rel_label, "type": "SANDBOX", "severity": "MEDIUM",
             "description": (
                 "Dynamic behavioral analysis unavailable in this environment (no Docker access). "
-                "Only static signatures (Regex/Entropy/AI) applied — manual verification recommended."
+                "Only static signatures (Regex/Entropy) applied — manual verification recommended."
             ),
             "engine": "Engine 3 — Behavioral Sandbox"
         }]
@@ -329,7 +327,7 @@ def execute_in_sandbox(file_bytes, filename, rel_label):
                 pass
 
 # ─────────────────────────────────────
-# ENGINE 4 — AI ANALYSIS
+# ENGINE 4 — AI ANALYSIS (binaries & archives ONLY — files sandbox can't run)
 # ─────────────────────────────────────
 def extract_strings_from_bytes(file_bytes, min_length=5):
     pattern = rb"[\x20-\x7e]{%d,}" % min_length
@@ -360,7 +358,7 @@ def ai_analyze_file(filename, file_bytes, file_type):
     if not strings_list:
         return {
             "file": filename, "type": "AI_ANALYSIS", "severity": "HIGH",
-            "description": f"No readable strings found in {filename} — file is likely packed or encrypted. This is a strong indicator of deliberate obfuscation.",
+            "description": f"No readable strings found in {filename} — file is likely packed or encrypted. Strong indicator of deliberate obfuscation.",
             "engine": "Engine 4 — AI Analysis"
         }
 
@@ -368,6 +366,7 @@ def ai_analyze_file(filename, file_bytes, file_type):
     sample_strings = "\n".join(strings_list[:300])
 
     prompt = f"""You are a malware analyst. Analyze this specific {file_type} file named '{filename}'.
+This file could NOT be executed in a sandbox (it is a compiled binary, archive, or macro document), so your analysis is based only on extracted strings.
 
 Detected URLs: {indicators['urls']}
 Detected IPs: {indicators['ips']}
@@ -395,6 +394,22 @@ REASON: [Specific 2-3 sentence analysis of what THIS file does based on its actu
             timeout=20,
         )
         data = response.json()
+
+        if "error" in data:
+            error_msg = data["error"].get("message", str(data["error"])) if isinstance(data["error"], dict) else str(data["error"])
+            return {
+                "file": filename, "type": "AI_ANALYSIS", "severity": "INFO",
+                "description": f"AI analysis failed — API error: {error_msg[:150]}",
+                "engine": "Engine 4 — AI Analysis"
+            }
+
+        if "choices" not in data or not data["choices"]:
+            return {
+                "file": filename, "type": "AI_ANALYSIS", "severity": "INFO",
+                "description": f"AI analysis failed — unexpected response: {str(data)[:150]}",
+                "engine": "Engine 4 — AI Analysis"
+            }
+
         ai_text = data["choices"][0]["message"]["content"]
     except Exception as e:
         return {
@@ -424,7 +439,7 @@ REASON: [Specific 2-3 sentence analysis of what THIS file does based on its actu
     }
 
 # ─────────────────────────────────────
-# STREAMING SCAN ENDPOINT
+# STREAMING SCAN ENDPOINT (used for ALL environments — local AND Render)
 # ─────────────────────────────────────
 def sse_event(data):
     return f"data: {json.dumps(data)}\n\n"
@@ -469,86 +484,50 @@ def scan_stream():
                 skipped_files.append(filename)
                 continue
 
-            yield sse_event({
-                "type": "file_start",
-                "filename": filename,
-                "file_type": ext
-            })
+            yield sse_event({"type": "file_start", "filename": filename, "file_type": ext})
 
             file_bytes = get_file_bytes(download_url) if download_url else b""
             content = file_bytes.decode("utf-8", errors="ignore") if ext in SCAN_EXTENSIONS else ""
 
             file_findings = []
+            is_ai_target = ext in AI_ANALYSIS_EXTENSIONS  # binaries, archives, macro docs
 
-            # Engine 1: Regex
+            # Engine 1: Regex — scripts only
             if ext in SCAN_EXTENSIONS and content:
-                yield sse_event({
-                    "type": "engine_start", "engine": "regex",
-                    "message": f"Running Regex Engine on {filename}..."
-                })
+                yield sse_event({"type": "engine_start", "engine": "regex", "message": f"Running Regex Engine on {filename}..."})
                 regex_results = regex_scan(content, filename)
                 file_findings.extend(regex_results)
-                yield sse_event({
-                    "type": "engine_done", "engine": "regex",
-                    "message": f"Regex complete — {len(regex_results)} pattern(s) matched",
-                    "findings": regex_results
-                })
+                yield sse_event({"type": "engine_done", "engine": "regex", "message": f"Regex complete — {len(regex_results)} pattern(s) matched", "findings": regex_results})
 
-            # Engine 2: Entropy
+            # Engine 2: Entropy — scripts only
             if ext in SCAN_EXTENSIONS and content:
-                yield sse_event({
-                    "type": "engine_start", "engine": "entropy",
-                    "message": f"Running Entropy Engine on {filename}..."
-                })
+                yield sse_event({"type": "engine_start", "engine": "entropy", "message": f"Running Entropy Engine on {filename}..."})
                 entropy_results = entropy_scan(content, filename)
                 file_findings.extend(entropy_results)
-                yield sse_event({
-                    "type": "engine_done", "engine": "entropy",
-                    "message": f"Entropy complete — {len(entropy_results)} anomaly(s) found",
-                    "findings": entropy_results
-                })
+                yield sse_event({"type": "engine_done", "engine": "entropy", "message": f"Entropy complete — {len(entropy_results)} anomaly(s) found", "findings": entropy_results})
 
-            # Engine 3: Sandbox
+            # Engine 3: Sandbox — scripts only
             if ext in SCAN_EXTENSIONS and file_bytes:
-                yield sse_event({
-                    "type": "engine_start", "engine": "sandbox",
-                    "message": f"Executing {filename} in isolated Docker container..."
-                })
+                yield sse_event({"type": "engine_start", "engine": "sandbox", "message": f"Executing {filename} in isolated Docker container..."})
                 sandbox_results = execute_in_sandbox(file_bytes, filename, filename)
                 file_findings.extend(sandbox_results)
-                yield sse_event({
-                    "type": "engine_done", "engine": "sandbox",
-                    "message": f"Sandbox complete — {len(sandbox_results)} behavior(s) detected",
-                    "findings": sandbox_results
-                })
+                yield sse_event({"type": "engine_done", "engine": "sandbox", "message": f"Sandbox complete — {len(sandbox_results)} behavior(s) detected", "findings": sandbox_results})
 
-            # Engine 4: AI
-            if file_bytes:
-                yield sse_event({
-                    "type": "engine_start", "engine": "ai",
-                    "message": f"Sending {filename} to AI analysis engine..."
-                })
+            # Engine 4: AI — ONLY for binaries/archives/macros that sandbox cannot run
+            if is_ai_target and file_bytes:
+                yield sse_event({"type": "engine_start", "engine": "ai", "message": f"Sandbox cannot execute {filename} — running AI string analysis..."})
                 file_type = (
-                    "script" if ext in SCAN_EXTENSIONS else
                     "compiled binary" if ext in FLAG_ONLY_EXTENSIONS else
                     "archive" if ext in ARCHIVE_EXTENSIONS else
-                    "macro document" if ext in MACRO_RISK_EXTENSIONS else
-                    "unknown file"
+                    "macro document"
                 )
                 ai_result = ai_analyze_file(filename, file_bytes, file_type)
                 file_findings.append(ai_result)
-                yield sse_event({
-                    "type": "engine_done", "engine": "ai",
-                    "message": f"AI analysis complete",
-                    "findings": [ai_result]
-                })
+                yield sse_event({"type": "engine_done", "engine": "ai", "message": "AI analysis complete", "findings": [ai_result]})
 
             # Archive handling — .zip extracted in memory
             if ext == ".zip" and file_bytes:
-                yield sse_event({
-                    "type": "engine_start", "engine": "archive",
-                    "message": f"Extracting and scanning contents of {filename}..."
-                })
+                yield sse_event({"type": "engine_start", "engine": "archive", "message": f"Extracting and scanning contents of {filename}..."})
                 try:
                     zip_bytes = io.BytesIO(file_bytes)
                     inner_executable_count = 0
@@ -562,16 +541,20 @@ def scan_stream():
                             inner_bytes = archive.read(inner_name)
                             inner_content = inner_bytes.decode("utf-8", errors="ignore") if inner_ext in SCAN_EXTENSIONS else ""
                             rel = f"{filename} → {inner_name}"
+
                             if inner_content:
                                 file_findings.extend(regex_scan(inner_content, rel))
                                 file_findings.extend(entropy_scan(inner_content, rel))
+
                             if inner_bytes:
                                 if inner_ext in INTERPRETER_MAP:
+                                    # Executable inside zip — sandbox covers it
                                     inner_executable_count += 1
-                                file_findings.extend(execute_in_sandbox(inner_bytes, inner_name, rel))
-                                file_findings.append(ai_analyze_file(inner_name, inner_bytes, "file inside archive"))
+                                    file_findings.extend(execute_in_sandbox(inner_bytes, inner_name, rel))
+                                else:
+                                    # Non-executable inner file (e.g. nested binary) — AI covers it
+                                    file_findings.append(ai_analyze_file(inner_name, inner_bytes, "file inside archive"))
 
-                    # ── ESCALATION: never let unverifiable archive contents resolve to CLEAN ──
                     if not DOCKER_AVAILABLE and inner_executable_count > 0:
                         file_findings.append({
                             "file": filename, "type": "ARCHIVE", "severity": "HIGH",
@@ -584,40 +567,33 @@ def scan_stream():
                         })
 
                     zip_bytes.close()
-                    yield sse_event({
-                        "type": "engine_done", "engine": "archive",
-                        "message": f"Archive scan complete"
-                    })
+                    yield sse_event({"type": "engine_done", "engine": "archive", "message": "Archive scan complete"})
                 except Exception as e:
                     file_findings.append({
                         "file": filename, "type": "ARCHIVE", "severity": "HIGH",
                         "description": f"Could not inspect archive contents: {str(e)[:100]}. Manual verification required.",
                         "engine": "Archive Inspector"
                     })
-                    yield sse_event({
-                        "type": "engine_done", "engine": "archive",
-                        "message": f"Could not open archive: {str(e)[:80]}"
-                    })
+                    yield sse_event({"type": "engine_done", "engine": "archive", "message": f"Could not open archive: {str(e)[:80]}"})
+
             elif ext in ARCHIVE_EXTENSIONS and ext != ".zip":
-                # .7z, .rar, .tar, .gz — never extracted, always flagged HIGH regardless of Docker
                 file_findings.append({
                     "file": filename, "type": "ARCHIVE", "severity": "HIGH",
-                    "description": f"{ext.upper()} archive — cannot extract in memory. AI string analysis applied to raw bytes. Manual verification required.",
+                    "description": f"{ext.upper()} archive — cannot extract in memory. AI string analysis applied above. Manual verification required.",
                     "engine": "Archive Inspector"
                 })
 
             if ext in FLAG_ONLY_EXTENSIONS:
-                # Compiled binaries — never executed, always flagged HIGH regardless of Docker
                 file_findings.append({
                     "file": filename, "type": "BINARY", "severity": "HIGH",
-                    "description": f"Compiled binary ({ext}) detected — not executed. AI string analysis applied. Manual verification required.",
+                    "description": f"Compiled binary ({ext}) detected — not executed. AI string analysis applied above. Manual verification required.",
                     "engine": "File Type Classifier"
                 })
 
             if ext in MACRO_RISK_EXTENSIONS:
                 file_findings.append({
                     "file": filename, "type": "MACRO_RISK", "severity": "MEDIUM",
-                    "description": f"Macro-enabled {ext} document — may contain auto-executing embedded code. AI string analysis applied.",
+                    "description": f"Macro-enabled {ext} document — may contain auto-executing embedded code. AI string analysis applied above.",
                     "engine": "File Type Classifier"
                 })
 
@@ -631,7 +607,6 @@ def scan_stream():
                 "file_findings": file_findings
             })
 
-        # Final verdict
         high_count = len([f for f in all_findings if f.get("severity") == "HIGH"])
         medium_count = len([f for f in all_findings if f.get("severity") == "MEDIUM"])
 
@@ -662,69 +637,9 @@ def scan_stream():
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
         }
     )
-
-# Keep old endpoint for backward compatibility
-@app.route("/scan", methods=["POST"])
-def scan():
-    data = request.get_json()
-    url = data.get("url", "")
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-    owner, repo, path = parse_github_url(url)
-    if not owner or not repo:
-        return jsonify({"error": "Invalid GitHub URL"}), 400
-    files = get_files_from_github(owner, repo, path)
-    if not files:
-        return jsonify({"error": "No files found in repository or path"}), 404
-
-    all_findings = []
-    scanned_files = []
-
-    for file in files:
-        filename = file["name"]
-        download_url = file.get("download_url")
-        ext = "." + filename.split(".")[-1].lower() if "." in filename else ""
-        if ext in SKIP_EXTENSIONS:
-            continue
-        file_bytes = get_file_bytes(download_url) if download_url else b""
-        content = file_bytes.decode("utf-8", errors="ignore") if ext in SCAN_EXTENSIONS else ""
-        if content:
-            all_findings.extend(regex_scan(content, filename))
-            all_findings.extend(entropy_scan(content, filename))
-        if file_bytes and ext in SCAN_EXTENSIONS:
-            all_findings.extend(execute_in_sandbox(file_bytes, filename, filename))
-        if ext in FLAG_ONLY_EXTENSIONS:
-            all_findings.append({
-                "file": filename, "type": "BINARY", "severity": "HIGH",
-                "description": f"Compiled binary ({ext}) detected — not executed. Manual verification required.",
-                "engine": "File Type Classifier"
-            })
-        if ext in ARCHIVE_EXTENSIONS and ext != ".zip":
-            all_findings.append({
-                "file": filename, "type": "ARCHIVE", "severity": "HIGH",
-                "description": f"{ext.upper()} archive — cannot extract in memory. Manual verification required.",
-                "engine": "Archive Inspector"
-            })
-        if file_bytes:
-            file_type = "script" if ext in SCAN_EXTENSIONS else "binary/archive"
-            all_findings.append(ai_analyze_file(filename, file_bytes, file_type))
-        scanned_files.append(filename)
-
-    high_count = len([f for f in all_findings if f.get("severity") == "HIGH"])
-    medium_count = len([f for f in all_findings if f.get("severity") == "MEDIUM"])
-    status = "THREAT DETECTED" if high_count > 0 else ("REVIEW RECOMMENDED" if medium_count > 0 else "CLEAN")
-
-    return jsonify({
-        "owner": owner, "repo": repo, "path": path,
-        "total_files_found": len(files),
-        "scanned_files": scanned_files,
-        "total_files_scanned": len(scanned_files),
-        "total_findings": len(all_findings),
-        "status": status,
-        "findings": all_findings,
-    })
 
 @app.route("/", methods=["GET"])
 def health():
