@@ -19,7 +19,9 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 app = Flask(__name__)
 
-# Near the top of app.py, after imports
+# ─────────────────────────────────────
+# DOCKER AVAILABILITY CHECK (run once at startup)
+# ─────────────────────────────────────
 def docker_is_available():
     try:
         client = docker.from_env(timeout=2)
@@ -30,6 +32,8 @@ def docker_is_available():
 
 DOCKER_AVAILABLE = docker_is_available()
 print(f"DOCKER AVAILABLE: {DOCKER_AVAILABLE}")
+print(f"GITHUB TOKEN LOADED: {'YES' if GITHUB_TOKEN else 'NO - RATE LIMIT WILL OCCUR'}")
+print(f"GROQ API KEY LOADED: {'YES' if GROQ_API_KEY else 'NO - AI ANALYSIS DISABLED'}")
 
 # ─────────────────────────────────────
 # FILE TIER CLASSIFICATION
@@ -126,7 +130,6 @@ def regex_scan(content, filename):
             key = (filename, description)
             if key not in seen:
                 seen.add(key)
-                # Find the actual line containing the match
                 line_context = ""
                 for i, line in enumerate(content.splitlines()):
                     if re.search(pattern, line, re.IGNORECASE):
@@ -261,6 +264,12 @@ def parse_behavior(trace_output, rel_label):
     return findings
 
 def execute_in_sandbox(file_bytes, filename, rel_label):
+    """
+    Returns:
+      - [] if file type isn't executable (no interpreter match)
+      - [unavailable finding] if Docker isn't reachable in this environment
+      - [behavioral findings] if sandbox ran successfully
+    """
     ext = "." + filename.split(".")[-1].lower() if "." in filename else ""
     interpreter = INTERPRETER_MAP.get(ext)
     if not interpreter:
@@ -268,24 +277,17 @@ def execute_in_sandbox(file_bytes, filename, rel_label):
 
     if not DOCKER_AVAILABLE:
         return [{
-            "file": rel_label, "type": "SANDBOX", "severity": "INFO",
-            "description": "Sandbox execution unavailable in this environment (no Docker access). Static analysis (Regex, Entropy, AI) still applied.",
-            "engine": "Engine 3 — Behavioral Sandbox"
-        }]
-
-    # Fast-fail if Docker isn't available at all (e.g. on Render)
-    try:
-        client = docker.from_env(timeout=2)  # 2 second connection timeout
-        client.ping()
-    except Exception:
-        return [{
-            "file": rel_label, "type": "SANDBOX", "severity": "INFO",
-            "description": "Sandbox execution unavailable in this environment (no Docker access). Static analysis (Regex, Entropy, AI) still applied.",
+            "file": rel_label, "type": "SANDBOX", "severity": "MEDIUM",
+            "description": (
+                "Dynamic behavioral analysis unavailable in this environment (no Docker access). "
+                "Only static signatures (Regex/Entropy/AI) applied — manual verification recommended."
+            ),
             "engine": "Engine 3 — Behavioral Sandbox"
         }]
 
     container = None
     try:
+        client = docker.from_env(timeout=5)
         container = client.containers.create(
             DOCKER_IMAGE,
             command=["sleep", "60"],
@@ -309,14 +311,14 @@ def execute_in_sandbox(file_bytes, filename, rel_label):
         return parse_behavior(output, rel_label)
     except docker.errors.ImageNotFound:
         return [{
-            "file": rel_label, "type": "SANDBOX", "severity": "INFO",
-            "description": "Sandbox image not found — build it first.",
+            "file": rel_label, "type": "SANDBOX", "severity": "MEDIUM",
+            "description": "Sandbox image not found — build it first: docker build -f Dockerfile.sandbox -t gitshield-sandbox:latest .",
             "engine": "Engine 3 — Behavioral Sandbox"
         }]
     except Exception as e:
         return [{
-            "file": rel_label, "type": "SANDBOX", "severity": "INFO",
-            "description": f"Sandbox unavailable: {str(e)[:80]}",
+            "file": rel_label, "type": "SANDBOX", "severity": "MEDIUM",
+            "description": f"Sandbox execution failed — manual verification recommended. ({str(e)[:80]})",
             "engine": "Engine 3 — Behavioral Sandbox"
         }]
     finally:
@@ -325,6 +327,7 @@ def execute_in_sandbox(file_bytes, filename, rel_label):
                 container.remove(force=True)
             except Exception:
                 pass
+
 # ─────────────────────────────────────
 # ENGINE 4 — AI ANALYSIS
 # ─────────────────────────────────────
@@ -440,7 +443,6 @@ def scan_stream():
             yield sse_event({"type": "error", "message": "Invalid GitHub URL"})
             return
 
-        # Stage 1: Fetch files
         yield sse_event({"type": "stage", "stage": "fetch", "message": "Connecting to GitHub API..."})
         files = get_files_from_github(owner, repo, path)
 
@@ -541,7 +543,7 @@ def scan_stream():
                     "findings": [ai_result]
                 })
 
-            # Archive handling
+            # Archive handling — .zip extracted in memory
             if ext == ".zip" and file_bytes:
                 yield sse_event({
                     "type": "engine_start", "engine": "archive",
@@ -549,11 +551,12 @@ def scan_stream():
                 })
                 try:
                     zip_bytes = io.BytesIO(file_bytes)
+                    inner_executable_count = 0
                     with zipfile.ZipFile(zip_bytes) as archive:
                         for inner_name in archive.namelist():
                             if inner_name.endswith("/"):
                                 continue
-                            inner_ext = "." + inner_name.split(".")[-1].lower()
+                            inner_ext = "." + inner_name.split(".")[-1].lower() if "." in inner_name else ""
                             if inner_ext in SKIP_EXTENSIONS:
                                 continue
                             inner_bytes = archive.read(inner_name)
@@ -563,29 +566,51 @@ def scan_stream():
                                 file_findings.extend(regex_scan(inner_content, rel))
                                 file_findings.extend(entropy_scan(inner_content, rel))
                             if inner_bytes:
+                                if inner_ext in INTERPRETER_MAP:
+                                    inner_executable_count += 1
                                 file_findings.extend(execute_in_sandbox(inner_bytes, inner_name, rel))
                                 file_findings.append(ai_analyze_file(inner_name, inner_bytes, "file inside archive"))
+
+                    # ── ESCALATION: never let unverifiable archive contents resolve to CLEAN ──
+                    if not DOCKER_AVAILABLE and inner_executable_count > 0:
+                        file_findings.append({
+                            "file": filename, "type": "ARCHIVE", "severity": "HIGH",
+                            "description": (
+                                f"Archive contains {inner_executable_count} executable script(s) that could not be "
+                                f"behaviorally verified (sandbox unavailable in this environment). "
+                                f"Manual verification required before opening."
+                            ),
+                            "engine": "Engine 3 — Behavioral Sandbox"
+                        })
+
                     zip_bytes.close()
                     yield sse_event({
                         "type": "engine_done", "engine": "archive",
                         "message": f"Archive scan complete"
                     })
                 except Exception as e:
+                    file_findings.append({
+                        "file": filename, "type": "ARCHIVE", "severity": "HIGH",
+                        "description": f"Could not inspect archive contents: {str(e)[:100]}. Manual verification required.",
+                        "engine": "Archive Inspector"
+                    })
                     yield sse_event({
                         "type": "engine_done", "engine": "archive",
                         "message": f"Could not open archive: {str(e)[:80]}"
                     })
             elif ext in ARCHIVE_EXTENSIONS and ext != ".zip":
+                # .7z, .rar, .tar, .gz — never extracted, always flagged HIGH regardless of Docker
                 file_findings.append({
                     "file": filename, "type": "ARCHIVE", "severity": "HIGH",
-                    "description": f"{ext.upper()} archive — cannot extract in memory. AI analysis applied to raw bytes.",
+                    "description": f"{ext.upper()} archive — cannot extract in memory. AI string analysis applied to raw bytes. Manual verification required.",
                     "engine": "Archive Inspector"
                 })
 
             if ext in FLAG_ONLY_EXTENSIONS:
+                # Compiled binaries — never executed, always flagged HIGH regardless of Docker
                 file_findings.append({
                     "file": filename, "type": "BINARY", "severity": "HIGH",
-                    "description": f"Compiled binary ({ext}) detected — not executed. AI string analysis applied.",
+                    "description": f"Compiled binary ({ext}) detected — not executed. AI string analysis applied. Manual verification required.",
                     "engine": "File Type Classifier"
                 })
 
@@ -670,6 +695,18 @@ def scan():
             all_findings.extend(entropy_scan(content, filename))
         if file_bytes and ext in SCAN_EXTENSIONS:
             all_findings.extend(execute_in_sandbox(file_bytes, filename, filename))
+        if ext in FLAG_ONLY_EXTENSIONS:
+            all_findings.append({
+                "file": filename, "type": "BINARY", "severity": "HIGH",
+                "description": f"Compiled binary ({ext}) detected — not executed. Manual verification required.",
+                "engine": "File Type Classifier"
+            })
+        if ext in ARCHIVE_EXTENSIONS and ext != ".zip":
+            all_findings.append({
+                "file": filename, "type": "ARCHIVE", "severity": "HIGH",
+                "description": f"{ext.upper()} archive — cannot extract in memory. Manual verification required.",
+                "engine": "Archive Inspector"
+            })
         if file_bytes:
             file_type = "script" if ext in SCAN_EXTENSIONS else "binary/archive"
             all_findings.append(ai_analyze_file(filename, file_bytes, file_type))
@@ -691,7 +728,10 @@ def scan():
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "GitShield Backend Running"})
+    return jsonify({
+        "status": "GitShield Backend Running",
+        "docker_available": DOCKER_AVAILABLE
+    })
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000, threaded=True)
